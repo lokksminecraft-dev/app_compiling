@@ -181,26 +181,61 @@ jobs:
           import android.os.Build
           import android.os.IBinder
           import kotlin.math.PI
+          import kotlin.math.abs
           import kotlin.math.cos
+          import kotlin.math.ln
+          import kotlin.math.log2
           import kotlin.math.max
+          import kotlin.math.min
+          import kotlin.math.pow
+          import kotlin.math.roundToInt
+          import kotlin.math.sin
           import kotlin.math.sqrt
+
+          // nome = só para exibir | midi = nota na notação do N64 (62 = Ré, 65 = Fá...) | botao = botão a apertar
+          class Nota(val nome: String, val midi: Int, val botao: String)
 
           class OcarinaService : Service() {
 
               companion object {
-                  // Ré, Fá, Lá, Si, Ré agudo  ->  A, C-Baixo, C-Direita, C-Esquerda, C-Cima
-                  val BASE = doubleArrayOf(293.66, 349.23, 440.00, 493.88, 587.33)
+                  // ===================== CONFIGURAÇÃO =====================
+                  // Para ADICIONAR NOTAS: acrescente linhas aqui. Dois botões iguais usam a mesma posição.
+                  // Cada botão novo será pedido na calibração.
+                  // MIDI: Dó=60 Dó#=61 Ré=62 Ré#=63 Mi=64 Fá=65 Fá#=66 Sol=67 Sol#=68 Lá=69 Lá#=70 Si=71 Dó agudo=72
+                  val NOTAS = listOf(
+                      Nota("Ré", 62, "A"),
+                      Nota("Fá", 65, "C-Baixo"),
+                      Nota("Lá", 69, "C-Direita"),
+                      Nota("Si", 71, "C-Esquerda"),
+                      Nota("Ré agudo", 74, "C-Cima"),
+                      // Exemplos (apague as duas barras para ativar):
+                      // Nota("Mi", 64, "B"),
+                      // Nota("Sol", 67, "Z"),
+                  )
 
-                  // Ocarina de 12 furos Alto C (a mais comum): 2.0 (soa uma oitava acima da notação do N64).
-                  // Se a sua soar nas frequências de BASE, use 1.0. Veja a nota detectada na tela do app.
-                  const val OITAVA = 2.0
+                  // Semitons que sua ocarina soa ACIMA da notação acima.
+                  // Ocarina 12 furos Alto C = 12. Se a sua soar mais grave, use 0.
+                  // A tela do app mostra a nota real detectada para você conferir.
+                  const val DESLOCAR = 12
+
+                  // Se sua ocarina é afinada diferente de A=440 Hz, ajuste em cents (ex.: -30).
+                  const val AFINACAO = 0.0
+
+                  // Margem aceita de desafinação, em cents (100 cents = 1 semitom).
+                  const val TOLERANCIA = 50.0
+
+                  const val VOLUME_MIN = 0.01   // sobe se pegar ruído, desce se não detectar
+                  const val TONALIDADE = 6.0    // sobe se pegar ruído, desce se não detectar notas
+                  // ========================================================
+
+                  val BOTOES: List<String> get() = NOTAS.map { it.botao }.distinct()
 
                   const val SR = 44100
-                  const val BLOCO = 2048          // ~46 ms
-                  const val VOLUME_MIN = 0.01     // sobe se pegar ruído, desce se não detectar
-                  const val PUREZA_MIN = 0.5      // quão "limpa" precisa ser a nota (0 a 1)
+                  const val HOP = 1024        // análise a cada ~23 ms
+                  const val JANELA = 4096     // trecho analisado (~93 ms)
+                  const val FFT_N = 16384
 
-                  val NOMES = arrayOf("A (Ré)", "C-Baixo (Fá)", "C-Direita (Lá)", "C-Esquerda (Si)", "C-Cima (Ré agudo)")
+                  val NOMES_NOTAS = arrayOf("Dó", "Dó#", "Ré", "Ré#", "Mi", "Fá", "Fá#", "Sol", "Sol#", "Lá", "Lá#", "Si")
 
                   @Volatile var ultimaNota = "-"
                   @Volatile var debug = ""
@@ -208,6 +243,19 @@ jobs:
 
               @Volatile private var rodando = false
               private var thread: Thread? = null
+
+              private val re = DoubleArray(FFT_N)
+              private val im = DoubleArray(FFT_N)
+              private val mag = DoubleArray(FFT_N / 2)
+              private val hann = DoubleArray(JANELA) { 0.5 - 0.5 * cos(2 * PI * it / (JANELA - 1)) }
+              private val cosT = DoubleArray(FFT_N / 2) { cos(-2 * PI * it / FFT_N) }
+              private val sinT = DoubleArray(FFT_N / 2) { sin(-2 * PI * it / FFT_N) }
+              private val rev = IntArray(FFT_N) { Integer.reverse(it) ushr (32 - Integer.numberOfTrailingZeros(FFT_N)) }
+              private val binHz = SR.toDouble() / FFT_N
+              private val iMin = (NOTAS.minOf { freqDe(it) } * 0.85 / binHz).toInt()
+              private val iMax = min((NOTAS.maxOf { freqDe(it) } * 1.15 / binHz).toInt(), FFT_N / 2 - 2)
+
+              private fun freqDe(n: Nota): Double = 440.0 * 2.0.pow((n.midi + DESLOCAR - 69) / 12.0)
 
               override fun onBind(i: Intent?): IBinder? = null
 
@@ -240,26 +288,31 @@ jobs:
                   val minBuf = AudioRecord.getMinBufferSize(SR, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
                   val rec = AudioRecord(
                       MediaRecorder.AudioSource.MIC, SR, AudioFormat.CHANNEL_IN_MONO,
-                      AudioFormat.ENCODING_PCM_16BIT, max(minBuf, BLOCO * 4)
+                      AudioFormat.ENCODING_PCM_16BIT, max(minBuf, HOP * 8)
                   )
                   rec.startRecording()
-                  val buf = ShortArray(BLOCO)
-                  val x = DoubleArray(BLOCO)
+                  val hop = ShortArray(HOP)
+                  val ring = DoubleArray(JANELA)
+                  var cheio = 0
                   var cand = -1; var cont = 0; var silencio = 0; var atual = -1
 
                   while (rodando) {
                       var lidos = 0
-                      while (lidos < BLOCO && rodando) {
-                          val r = rec.read(buf, lidos, BLOCO - lidos)
+                      while (lidos < HOP && rodando) {
+                          val r = rec.read(hop, lidos, HOP - lidos)
                           if (r < 0) { Thread.sleep(10); break }
                           lidos += r
                       }
-                      if (lidos < BLOCO) continue
+                      if (lidos < HOP) continue
 
-                      val nota = detectar(buf, x)
+                      System.arraycopy(ring, HOP, ring, 0, JANELA - HOP)
+                      for (i in 0 until HOP) ring[JANELA - HOP + i] = hop[i] / 32768.0
+                      if (cheio < JANELA) { cheio += HOP; continue }
+
+                      val nota = analisar(ring)
                       if (nota < 0) {
                           silencio++; cand = -1; cont = 0
-                          if (silencio >= 2 && atual != -1) {
+                          if (silencio >= 3 && atual != -1) {
                               atual = -1; ultimaNota = "-"
                               TapService.instance?.pressButton(null)
                           }
@@ -268,8 +321,9 @@ jobs:
                       silencio = 0
                       if (nota == cand) cont++ else { cand = nota; cont = 1 }
                       if (cont >= 2 && nota != atual) {
-                          atual = nota; ultimaNota = NOMES[nota]
-                          TapService.instance?.pressButton(nota)
+                          atual = nota
+                          ultimaNota = NOTAS[nota].nome + " -> " + NOTAS[nota].botao
+                          TapService.instance?.pressButton(NOTAS[nota].botao)
                       }
                   }
                   rec.stop(); rec.release()
@@ -277,33 +331,102 @@ jobs:
                   ultimaNota = "-"
               }
 
-              private fun detectar(b: ShortArray, x: DoubleArray): Int {
+              // Devolve o índice da nota em NOTAS, ou -1 se não houver nota válida
+              private fun analisar(x: DoubleArray): Int {
                   var mean = 0.0
-                  for (i in 0 until BLOCO) mean += b[i]
-                  mean /= BLOCO
+                  for (v in x) mean += v
+                  mean /= JANELA
                   var ss = 0.0
-                  for (i in 0 until BLOCO) { x[i] = (b[i] - mean) / 32768.0; ss += x[i] * x[i] }
-                  val rms = sqrt(ss / BLOCO)
-                  if (rms < VOLUME_MIN) { debug = "vol=%.3f (baixo)".format(rms); return -1 }
+                  for (i in 0 until JANELA) {
+                      val v = x[i] - mean
+                      ss += v * v
+                      re[i] = v * hann[i]
+                      im[i] = 0.0
+                  }
+                  val rms = sqrt(ss / JANELA)
+                  if (rms < VOLUME_MIN) { debug = "vol=%.3f (baixo demais)".format(rms); return -1 }
+                  for (i in JANELA until FFT_N) { re[i] = 0.0; im[i] = 0.0 }
+                  fft()
 
-                  val amp = DoubleArray(5) { goertzel(x, BASE[it] * OITAVA) }
-                  var best = 0
-                  for (i in 1..4) if (amp[i] > amp[best]) best = i
-                  var segundo = 0.0
-                  for (i in 0..4) if (i != best && amp[i] > segundo) segundo = amp[i]
-                  val pureza = amp[best] / (rms * sqrt(2.0))
-                  debug = "vol=%.3f pureza=%.2f".format(rms, pureza)
+                  var soma = 0.0
+                  var p = iMin
+                  for (i in iMin..iMax) {
+                      val m = sqrt(re[i] * re[i] + im[i] * im[i])
+                      mag[i] = m
+                      soma += m
+                      if (m > mag[p]) p = i
+                  }
+                  val media = soma / (iMax - iMin + 1)
+                  if (mag[p] < TONALIDADE * media) { debug = "vol=%.3f (nenhuma nota clara)".format(rms); return -1 }
 
-                  return if (pureza >= PUREZA_MIN && amp[best] > 1.5 * segundo) best else -1
+                  // Se o pico for um harmônico (2x), usa a fundamental
+                  val h = p / 2
+                  if (h - 3 >= iMin) {
+                      var q = h - 3
+                      for (i in (h - 3)..(h + 3)) if (mag[i] > mag[q]) q = i
+                      if (mag[q] > 0.4 * mag[p]) p = q
+                  }
+
+                  // Refina a frequência entre os bins (interpolação parabólica)
+                  var d = 0.0
+                  if (p > iMin && p < iMax) {
+                      val a = ln(mag[p - 1] + 1e-12)
+                      val b = ln(mag[p] + 1e-12)
+                      val c = ln(mag[p + 1] + 1e-12)
+                      val den = a - 2 * b + c
+                      if (den != 0.0) d = 0.5 * (a - c) / den
+                  }
+                  val f = (p + d) * binHz
+                  val midi = 69 + 12 * log2(f / 440.0) - AFINACAO / 100.0
+
+                  var melhor = -1
+                  var melhorDif = 1e9
+                  for (i in NOTAS.indices) {
+                      val dif = abs(midi - (NOTAS[i].midi + DESLOCAR)) * 100
+                      if (dif < melhorDif) { melhorDif = dif; melhor = i }
+                  }
+
+                  val m0 = midi.roundToInt()
+                  val cents = (midi - m0) * 100
+                  debug = "%.0f Hz = %s%d (%+.0f c)  vol=%.3f".format(
+                      f, NOMES_NOTAS[((m0 % 12) + 12) % 12], m0 / 12 - 1, cents, rms
+                  )
+                  return if (melhorDif <= TOLERANCIA) melhor else -1
               }
 
-              // Amplitude da frequência f no bloco (algoritmo de Goertzel)
-              private fun goertzel(x: DoubleArray, f: Double): Double {
-                  val k = 2 * cos(2 * PI * f / SR)
-                  var s1 = 0.0; var s2 = 0.0
-                  for (v in x) { val s = v + k * s1 - s2; s2 = s1; s1 = s }
-                  val p = s1 * s1 + s2 * s2 - k * s1 * s2
-                  return 2 * sqrt(max(p, 0.0)) / x.size
+              private fun fft() {
+                  val n = FFT_N
+                  for (i in 0 until n) {
+                      val j = rev[i]
+                      if (j > i) {
+                          val tr = re[i]; re[i] = re[j]; re[j] = tr
+                          val ti = im[i]; im[i] = im[j]; im[j] = ti
+                      }
+                  }
+                  var len = 2
+                  while (len <= n) {
+                      val half = len / 2
+                      val step = n / len
+                      var i = 0
+                      while (i < n) {
+                          var k = 0
+                          for (j in 0 until half) {
+                              val wr = cosT[k]
+                              val wi = sinT[k]
+                              val a = i + j
+                              val b = a + half
+                              val tr = re[b] * wr - im[b] * wi
+                              val ti = re[b] * wi + im[b] * wr
+                              re[b] = re[a] - tr
+                              im[b] = im[a] - ti
+                              re[a] += tr
+                              im[a] += ti
+                              k += step
+                          }
+                          i += len
+                      }
+                      len = len shl 1
+                  }
               }
           }
           ARQUIVO_FIM
@@ -327,168 +450,4 @@ jobs:
           import android.view.WindowManager
           import android.view.accessibility.AccessibilityEvent
           import android.widget.FrameLayout
-          import android.widget.TextView
-
-          class TapService : AccessibilityService() {
-
-              companion object {
-                  @Volatile var instance: TapService? = null
-                  private const val STEP = 60L // duração de cada pedaço do "toque contínuo"
-              }
-
-              private val main = Handler(Looper.getMainLooper())
-              private var stroke: StrokeDescription? = null
-              private var activePt: PointF? = null
-              private var wanted: PointF? = null
-              private var busy = false
-              private var overlay: FrameLayout? = null
-
-              override fun onServiceConnected() { instance = this }
-              override fun onAccessibilityEvent(e: AccessibilityEvent?) {}
-              override fun onInterrupt() {}
-              override fun onDestroy() { instance = null; super.onDestroy() }
-
-              // index = 0..4 (A, C-Baixo, C-Direita, C-Esquerda, C-Cima) ou null para soltar
-              fun pressButton(index: Int?) {
-                  val p = if (index == null) null else loadPoint(index)
-                  main.post { wanted = p; pump() }
-              }
-
-              private fun loadPoint(i: Int): PointF? {
-                  val sp = getSharedPreferences("ocarina", MODE_PRIVATE)
-                  if (!sp.contains("x$i")) return null
-                  return PointF(sp.getFloat("x$i", 0f), sp.getFloat("y$i", 0f))
-              }
-
-              private fun pathAt(p: PointF) = Path().apply { moveTo(p.x, p.y) }
-
-              // Mantém um único dedo "virtual" apertado enquanto a nota estiver soando
-              private fun pump() {
-                  if (busy) return
-                  val s = stroke
-                  val a = activePt
-                  val w = wanted
-                  if (s != null && a != null) {
-                      val keep = w != null && w == a
-                      val next = s.continueStroke(pathAt(a), 0, STEP, keep)
-                      if (keep) stroke = next else { stroke = null; activePt = null }
-                      send(next)
-                  } else if (w != null) {
-                      val next = StrokeDescription(pathAt(w), 0, STEP, true)
-                      stroke = next; activePt = w
-                      send(next)
-                  }
-              }
-
-              private fun send(s: StrokeDescription) {
-                  busy = true
-                  val ok = dispatchGesture(
-                      GestureDescription.Builder().addStroke(s).build(),
-                      object : GestureResultCallback() {
-                          override fun onCompleted(g: GestureDescription?) { busy = false; pump() }
-                          override fun onCancelled(g: GestureDescription?) {
-                              busy = false; stroke = null; activePt = null; pump()
-                          }
-                      }, null
-                  )
-                  if (!ok) { busy = false; stroke = null; activePt = null }
-              }
-
-              // Mostra uma camada transparente: você toca onde fica cada botão do emulador
-              fun startCalibration(delayMs: Long) {
-                  main.postDelayed({
-                      val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-                      overlay?.let { try { wm.removeView(it) } catch (e: Exception) {} }
-                      val ed = getSharedPreferences("ocarina", MODE_PRIVATE).edit()
-                      val nomes = OcarinaService.NOMES
-                      var step = 0
-
-                      val tv = TextView(this).apply {
-                          textSize = 22f; setTextColor(Color.WHITE); gravity = Gravity.CENTER
-                      }
-                      fun label() { tv.text = "Toque onde fica o botão\n${nomes[step]}\n(${step + 1}/5)" }
-                      label()
-
-                      val root = FrameLayout(this).apply {
-                          setBackgroundColor(0x66000000)
-                          addView(tv, FrameLayout.LayoutParams(
-                              ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER))
-                          setOnTouchListener { _, ev ->
-                              if (ev.action == MotionEvent.ACTION_DOWN) {
-                                  ed.putFloat("x$step", ev.rawX).putFloat("y$step", ev.rawY)
-                                  step++
-                                  if (step >= nomes.size) {
-                                      ed.apply()
-                                      wm.removeView(this)
-                                      this@TapService.overlay = null
-                                  } else label()
-                              }
-                              true
-                          }
-                      }
-                      val lp = WindowManager.LayoutParams(
-                          WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT,
-                          WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-                          WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-                          PixelFormat.TRANSLUCENT
-                      )
-                      wm.addView(root, lp)
-                      overlay = root
-                  }, delayMs)
-              }
-          }
-          ARQUIVO_FIM
-          mkdir -p "$(dirname 'app/src/main/res/values/strings.xml')"
-          cat > 'app/src/main/res/values/strings.xml' << 'ARQUIVO_FIM'
-          <resources>
-              <string name="acess_desc">Aperta os botões na tela do emulador quando você toca notas na ocarina.</string>
-          </resources>
-          ARQUIVO_FIM
-          mkdir -p "$(dirname 'app/src/main/res/xml/accessibility_config.xml')"
-          cat > 'app/src/main/res/xml/accessibility_config.xml' << 'ARQUIVO_FIM'
-          <?xml version="1.0" encoding="utf-8"?>
-          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
-              android:accessibilityEventTypes="typeWindowStateChanged"
-              android:accessibilityFeedbackType="feedbackGeneric"
-              android:canPerformGestures="true"
-              android:description="@string/acess_desc"
-              android:notificationTimeout="100" />
-          ARQUIVO_FIM
-          mkdir -p "$(dirname 'build.gradle.kts')"
-          cat > 'build.gradle.kts' << 'ARQUIVO_FIM'
-          plugins {
-              id("com.android.application") version "8.5.2" apply false
-              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
-          }
-          ARQUIVO_FIM
-          mkdir -p "$(dirname 'gradle.properties')"
-          cat > 'gradle.properties' << 'ARQUIVO_FIM'
-          org.gradle.jvmargs=-Xmx3g
-          android.useAndroidX=false
-          ARQUIVO_FIM
-          mkdir -p "$(dirname 'settings.gradle.kts')"
-          cat > 'settings.gradle.kts' << 'ARQUIVO_FIM'
-          pluginManagement {
-              repositories {
-                  google()
-                  mavenCentral()
-                  gradlePluginPortal()
-              }
-          }
-          dependencyResolutionManagement {
-              repositories {
-                  google()
-                  mavenCentral()
-              }
-          }
-          rootProject.name = "OcarinaController"
-          include(":app")
-          ARQUIVO_FIM
-
-      - name: Compilar
-        run: gradle assembleDebug --no-daemon
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ocarina-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+         
