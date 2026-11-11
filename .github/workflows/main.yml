@@ -420,7 +420,7 @@ jobs:
                                   if (step >= nomes.size) {
                                       ed.apply()
                                       wm.removeView(this)
-                                      overlay = null
+                                      this@TapService.overlay = null
                                   } else label()
                               }
                               true
