@@ -441,4 +441,5 @@ jobs:
           mkdir -p "$(dirname 'app/src/main/res/values/strings.xml')"
           cat > 'app/src/main/res/values/strings.xml' << 'ARQUIVO_FIM'
           <resources>
+          path: app/build/outputs/apk/debug/app-debug.apk
              
