@@ -109,6 +109,54 @@ jobs:
               @Volatile var entradaId = 0   // 0 = automática (sistema); senão, id do dispositivo de entrada
               private var carregado = false
 
+              // Botões que podem ser ligados a uma nota ("—" = nota desligada)
+              val BOTOES_DISPONIVEIS = listOf(
+                  "—", "A", "B", "Z", "R", "L", "Start",
+                  "C-Cima", "C-Baixo", "C-Esquerda", "C-Direita",
+                  "D-Cima", "D-Baixo", "D-Esquerda", "D-Direita"
+              )
+
+              // Faixa de notas (MIDI, na notação do jogo): 57 = Lá3 ... 77 = Fá5 (12 furos Alto C = Lá4 ... Fá6 com +12)
+              const val MIDI_MIN = 57
+              const val MIDI_MAX = 77
+              private val NOMES = arrayOf("Dó", "Dó#", "Ré", "Ré#", "Mi", "Fá", "Fá#", "Sol", "Sol#", "Lá", "Lá#", "Si")
+
+              // nota (MIDI) -> botão
+              @Volatile var mapa: Map<Int, String> = padraoMapa()
+              @Volatile var notas: List<Nota> = emptyList()
+              @Volatile var versaoMapa = 0
+
+              init { recalcular() }
+
+              private fun padraoMapa(): Map<Int, String> {
+                  val padrao = mapOf(
+                      62 to "A", 65 to "C-Baixo", 69 to "C-Direita", 71 to "C-Esquerda", 74 to "C-Cima",   // notas do jogo
+                      60 to "B", 64 to "Z", 67 to "R", 72 to "L", 76 to "Start"                               // extras
+                  )
+                  val m = LinkedHashMap<Int, String>()
+                  for (n in MIDI_MIN..MIDI_MAX) m[n] = padrao[n] ?: "—"
+                  return m
+              }
+
+              fun nomeNota(midi: Int): String = NOMES[((midi % 12) + 12) % 12] + (midi / 12 - 1)
+
+              fun recalcular() {
+                  notas = mapa.entries
+                      .filter { it.value != "—" }
+                      .sortedBy { it.key }
+                      .map { Nota(nomeNota(it.key), it.key, it.value) }
+                  versaoMapa++
+              }
+
+              fun botoesUsados(): List<String> = notas.map { it.botao }.distinct()
+
+              fun definirBotao(midi: Int, botao: String) {
+                  val m = LinkedHashMap(mapa)
+                  m[midi] = botao
+                  mapa = m
+                  recalcular()
+              }
+
               fun init(ctx: Context) {
                   if (carregado) return
                   carregado = true
@@ -123,6 +171,19 @@ jobs:
                   retocar = sp.getBoolean("retocar", retocar)
                   stepMs = sp.getFloat("stepMs", stepMs)
                   entradaId = sp.getInt("entradaId", entradaId)
+                  val salvo = sp.getString("mapa", null)
+                  if (salvo != null) {
+                      val m = LinkedHashMap(mapa)
+                      for (par in salvo.split(";")) {
+                          val p = par.split("=")
+                          if (p.size == 2) {
+                              val k = p[0].toIntOrNull()
+                              if (k != null && m.containsKey(k) && BOTOES_DISPONIVEIS.contains(p[1])) m[k] = p[1]
+                          }
+                      }
+                      mapa = m
+                      recalcular()
+                  }
               }
 
               fun salvar(ctx: Context) {
@@ -137,6 +198,7 @@ jobs:
                       .putBoolean("retocar", retocar)
                       .putFloat("stepMs", stepMs)
                       .putInt("entradaId", entradaId)
+                      .putString("mapa", mapa.entries.sortedBy { it.key }.joinToString(";") { "${it.key}=${it.value}" })
                       .apply()
               }
 
@@ -270,22 +332,7 @@ jobs:
           class OcarinaService : Service() {
 
               companion object {
-                  // Para ADICIONAR NOTAS: acrescente linhas aqui. Dois botões iguais usam a mesma posição.
-                  // Cada botão novo será pedido na calibração.
-                  // MIDI: Dó=60 Dó#=61 Ré=62 Ré#=63 Mi=64 Fá=65 Fá#=66 Sol=67 Sol#=68 Lá=69 Lá#=70 Si=71 Dó agudo=72
-                  // As demais configurações (oitava, sensibilidade etc.) ficam no HUD flutuante.
-                  val NOTAS = listOf(
-                      Nota("Ré", 62, "A"),
-                      Nota("Fá", 65, "C-Baixo"),
-                      Nota("Lá", 69, "C-Direita"),
-                      Nota("Si", 71, "C-Esquerda"),
-                      Nota("Ré agudo", 74, "C-Cima"),
-                      // Exemplos (apague as duas barras para ativar):
-                      // Nota("Mi", 64, "B"),
-                      // Nota("Sol", 67, "Z"),
-                  )
-
-                  val BOTOES: List<String> get() = NOTAS.map { it.botao }.distinct()
+                  // As notas e os botões são configurados no HUD flutuante (Cfg.mapa).
 
                   const val SR = 44100
                   const val HOP = 1024        // análise a cada ~23 ms
@@ -369,6 +416,7 @@ jobs:
                   var cheio = 0
                   var cand = -1; var cont = 0; var silencio = 0; var atual = -1
                   var ultimoPress = 0L
+                  var verAtual = Cfg.versaoMapa
 
                   while (rodando) {
                       if (Cfg.entradaId != idAtual) {
@@ -390,6 +438,15 @@ jobs:
                       for (i in 0 until HOP) ring[JANELA - HOP + i] = hop[i] / 32768.0
                       if (cheio < JANELA) { cheio += HOP; continue }
 
+                      val lista = Cfg.notas
+                      if (Cfg.versaoMapa != verAtual) {
+                          // Mapa de notas mudou no HUD: solta tudo e recomeça
+                          verAtual = Cfg.versaoMapa
+                          if (atual != -1) { atual = -1; TapService.instance?.pressButton(null) }
+                          cand = -1; cont = 0; silencio = 0
+                          continue
+                      }
+
                       if (!Cfg.ativo) {
                           if (atual != -1) { atual = -1; TapService.instance?.pressButton(null) }
                           cand = -1; cont = 0; silencio = 0
@@ -397,7 +454,7 @@ jobs:
                           continue
                       }
 
-                      val nota = analisar(ring, atual != -1)
+                      val nota = analisar(ring, atual != -1, lista)
                       val rms = ultimoRms
                       val rmsAnterior = (hist[0] + hist[1] + hist[2] + hist[3]) / 4
                       hist[histI] = rms
@@ -420,21 +477,21 @@ jobs:
                           if (atual == -1) {
                               if (cont >= estab) {
                                   atual = nota
-                                  ultimaNota = NOTAS[nota].nome + " -> " + NOTAS[nota].botao
-                                  TapService.instance?.pressButton(NOTAS[nota].botao)
+                                  ultimaNota = lista[nota].nome + " -> " + lista[nota].botao
+                                  TapService.instance?.pressButton(lista[nota].botao)
                                   ultimoPress = agora
                               }
                           } else if (nota != atual) {
                               // Trocar de nota exige mais confirmações do que começar uma
                               if (cont >= estab + 1) {
                                   atual = nota
-                                  ultimaNota = NOTAS[nota].nome + " -> " + NOTAS[nota].botao
-                                  TapService.instance?.pressButton(NOTAS[nota].botao)
+                                  ultimaNota = lista[nota].nome + " -> " + lista[nota].botao
+                                  TapService.instance?.pressButton(lista[nota].botao)
                                   ultimoPress = agora
                               }
                           } else if (Cfg.retocar && rms > 1.6 * rmsAnterior && rms > Cfg.volumeMin && agora - ultimoPress > 300) {
                               // Mesma nota tocada de novo (volume subiu de repente): aperta outra vez
-                              TapService.instance?.repress(NOTAS[nota].botao)
+                              TapService.instance?.repress(lista[nota].botao)
                               ultimoPress = agora
                           }
                       }
@@ -445,7 +502,8 @@ jobs:
               }
 
               // Devolve o índice da nota em NOTAS, ou -1 se não houver nota válida
-              private fun analisar(x: DoubleArray, sustentando: Boolean): Int {
+              private fun analisar(x: DoubleArray, sustentando: Boolean, lista: List<Nota>): Int {
+                  if (lista.isEmpty()) { debug = "nenhuma nota ligada a botão"; return -1 }
                   var mean = 0.0
                   for (v in x) mean += v
                   mean /= JANELA
@@ -466,7 +524,7 @@ jobs:
 
                   var fLo = Double.MAX_VALUE
                   var fHi = 0.0
-                  for (n in NOTAS) {
+                  for (n in lista) {
                       val f = freqDe(n)
                       if (f < fLo) fLo = f
                       if (f > fHi) fHi = f
@@ -506,19 +564,18 @@ jobs:
                   val f = (p + d) * binHz
                   val midi = 69 + 12 * log2(f / 440.0) - Cfg.afinacao / 100.0
 
+                  // Semitom mais próximo (na grade completa); só vale se essa nota estiver ligada a um botão
+                  val alvo = (midi - Cfg.deslocar).roundToInt()
+                  val melhorDif = abs(midi - (alvo + Cfg.deslocar)) * 100
                   var melhor = -1
-                  var melhorDif = 1e9
-                  for (i in NOTAS.indices) {
-                      val dif = abs(midi - (NOTAS[i].midi + Cfg.deslocar)) * 100
-                      if (dif < melhorDif) { melhorDif = dif; melhor = i }
-                  }
+                  for (i in lista.indices) if (lista[i].midi == alvo) melhor = i
 
                   val m0 = midi.roundToInt()
                   val cents = (midi - m0) * 100
                   debug = "%.0f Hz = %s%d (%+.0f c)  vol=%.3f".format(
                       f, NOMES_NOTAS[((m0 % 12) + 12) % 12], m0 / 12 - 1, cents, rms
                   )
-                  return if (melhorDif <= Cfg.tolerancia) melhor else -1
+                  return if (melhor >= 0 && melhorDif <= Cfg.tolerancia) melhor else -1
               }
 
               private fun fft() {
@@ -620,8 +677,11 @@ jobs:
                       val n = OcarinaService.ultimaNota
                       cabTv?.text = if (n != "-") "♪ $n" else "♪ Ocarina"
                       if (hudAberto) {
+                          val sp = getSharedPreferences("ocarina", MODE_PRIVATE)
+                          val faltam = Cfg.botoesUsados().filter { !sp.contains("x_$it") }
                           stTv?.text = "Nota: $n\n${OcarinaService.debug}\n" +
-                              "Apertos pedidos: $nComandos | Toques cancelados: $nCancel"
+                              "Apertos pedidos: $nComandos | Toques cancelados: $nCancel" +
+                              (if (faltam.isNotEmpty()) "\n⚠ Falta calibrar: ${faltam.joinToString()}" else "")
                       }
                       main.postDelayed(this, 200)
                   }
@@ -698,8 +758,9 @@ jobs:
                   main.postDelayed({
                       val wm = wmgr()
                       camada?.let { try { wm.removeView(it) } catch (e: Exception) {} }
+                      val nomes = Cfg.botoesUsados()
+                      if (nomes.isEmpty()) return@postDelayed
                       val ed = getSharedPreferences("ocarina", MODE_PRIVATE).edit()
-                      val nomes = OcarinaService.BOTOES
                       var step = 0
 
                       val tv = TextView(this).apply {
@@ -708,19 +769,30 @@ jobs:
                       fun label() { tv.text = "Toque onde fica o botão\n${nomes[step]}\n(${step + 1}/${nomes.size})" }
                       label()
 
-                      val root = FrameLayout(this).apply {
+                      lateinit var root: FrameLayout
+                      fun avancar() {
+                          step++
+                          if (step >= nomes.size) {
+                              ed.apply()
+                              try { wm.removeView(root) } catch (e: Exception) {}
+                              camada = null
+                          } else label()
+                      }
+
+                      root = FrameLayout(this).apply {
                           setBackgroundColor(0x66000000)
                           addView(tv, FrameLayout.LayoutParams(
                               ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER))
+                          addView(Button(this@TapService).apply {
+                              text = "Pular este botão (não existe na tela)"
+                              setOnClickListener { avancar() }
+                          }, FrameLayout.LayoutParams(
+                              ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                              Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL))
                           setOnTouchListener { _, ev ->
                               if (ev.action == MotionEvent.ACTION_DOWN) {
                                   ed.putFloat("x_${nomes[step]}", ev.rawX).putFloat("y_${nomes[step]}", ev.rawY)
-                                  step++
-                                  if (step >= nomes.size) {
-                                      ed.apply()
-                                      wm.removeView(this)
-                                      camada = null
-                                  } else label()
+                                  avancar()
                               }
                               true
                           }
@@ -875,9 +947,13 @@ jobs:
                   col.addView(tvEnt)
 
                   // Deslocamento de oitava
+                  val rotulosNotas = mutableListOf<Pair<Int, TextView>>()
+                  fun atualizarRotulos() { for ((m, tvn) in rotulosNotas) tvn.text = Cfg.nomeNota(m + Cfg.deslocar) }
                   val tvDesl = txt("", 12f)
-                  fun atualizarDesl() { tvDesl.text = "Deslocar notas: ${Cfg.deslocar} semitons (12 = uma oitava acima)" }
-                  atualizarDesl()
+                  fun atualizarDesl() {
+                      tvDesl.text = "Deslocar notas: ${Cfg.deslocar} semitons (12 = uma oitava acima)"
+                      atualizarRotulos()
+                  }
                   col.addView(tvDesl)
                   val linhaD = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
                   for (d in intArrayOf(-12, -1, 1, 12)) {
@@ -888,6 +964,32 @@ jobs:
                       }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
                   }
                   col.addView(linhaD)
+
+                  // Notas -> botões (toque no botão para trocar). "—" desliga a nota.
+                  col.addView(txt("Notas da ocarina e botões do jogo (toque no botão para trocar):", 12f))
+                  for (m in Cfg.MIDI_MIN..Cfg.MIDI_MAX) {
+                      val linha = LinearLayout(this).apply {
+                          orientation = LinearLayout.HORIZONTAL
+                          gravity = Gravity.CENTER_VERTICAL
+                      }
+                      val rot = txt("", 12f)
+                      rotulosNotas.add(m to rot)
+                      val bt = Button(this)
+                      bt.textSize = 11f
+                      bt.text = Cfg.mapa[m] ?: "—"
+                      bt.setOnClickListener {
+                          val opcoes = Cfg.BOTOES_DISPONIVEIS
+                          val i = opcoes.indexOf(Cfg.mapa[m] ?: "—")
+                          val novo = opcoes[(i + 1) % opcoes.size]
+                          Cfg.definirBotao(m, novo)
+                          bt.text = novo
+                          Cfg.salvar(this@TapService)
+                      }
+                      linha.addView(rot, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                      linha.addView(bt, LinearLayout.LayoutParams(dp(130), ViewGroup.LayoutParams.WRAP_CONTENT))
+                      col.addView(linha)
+                  }
+                  atualizarDesl()
 
                   slider(col, "Volume mínimo (menor = mais sensível)", 0.002f, 0.05f,
                       { Cfg.volumeMin }, { Cfg.volumeMin = it }, { "%.3f".format(it) })
@@ -912,7 +1014,7 @@ jobs:
                   })
 
                   col.addView(Button(this).apply {
-                      text = "Calibrar botões (começa em 5 s)"
+                      text = "Calibrar botões em uso (começa em 5 s)"
                       setOnClickListener {
                           hudAberto = false
                           rolagem.visibility = View.GONE
