@@ -106,6 +106,7 @@ jobs:
               @Volatile var afinacao = 0f
               @Volatile var retocar = true
               @Volatile var stepMs = 120f
+              @Volatile var entradaId = 0   // 0 = automática (sistema); senão, id do dispositivo de entrada
               private var carregado = false
 
               fun init(ctx: Context) {
@@ -121,6 +122,7 @@ jobs:
                   afinacao = sp.getFloat("afinacao", afinacao)
                   retocar = sp.getBoolean("retocar", retocar)
                   stepMs = sp.getFloat("stepMs", stepMs)
+                  entradaId = sp.getInt("entradaId", entradaId)
               }
 
               fun salvar(ctx: Context) {
@@ -134,6 +136,7 @@ jobs:
                       .putFloat("afinacao", afinacao)
                       .putBoolean("retocar", retocar)
                       .putFloat("stepMs", stepMs)
+                      .putInt("entradaId", entradaId)
                       .apply()
               }
 
@@ -243,6 +246,7 @@ jobs:
           import android.content.Intent
           import android.content.pm.ServiceInfo
           import android.media.AudioFormat
+          import android.media.AudioManager
           import android.media.AudioRecord
           import android.media.MediaRecorder
           import android.os.Build
@@ -338,13 +342,26 @@ jobs:
                   super.onDestroy()
               }
 
-              private fun loop() {
+              // Cria o gravador usando a entrada escolhida no HUD (cabo P2, USB...) ou a automática
+              private fun criarRec(): AudioRecord {
                   val minBuf = AudioRecord.getMinBufferSize(SR, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
-                  val rec = AudioRecord(
+                  val r = AudioRecord(
                       MediaRecorder.AudioSource.MIC, SR, AudioFormat.CHANNEL_IN_MONO,
                       AudioFormat.ENCODING_PCM_16BIT, max(minBuf, HOP * 8)
                   )
-                  rec.startRecording()
+                  val id = Cfg.entradaId
+                  if (id != 0) {
+                      val am = getSystemService(AudioManager::class.java)
+                      val dev = am.getDevices(AudioManager.GET_DEVICES_INPUTS).firstOrNull { it.id == id }
+                      if (dev != null) r.setPreferredDevice(dev)
+                  }
+                  r.startRecording()
+                  return r
+              }
+
+              private fun loop() {
+                  var rec = criarRec()
+                  var idAtual = Cfg.entradaId
                   val hop = ShortArray(HOP)
                   val ring = DoubleArray(JANELA)
                   val hist = DoubleArray(4)
@@ -354,6 +371,13 @@ jobs:
                   var ultimoPress = 0L
 
                   while (rodando) {
+                      if (Cfg.entradaId != idAtual) {
+                          // Trocou a entrada de áudio no HUD: recria o gravador
+                          rec.stop(); rec.release()
+                          rec = criarRec()
+                          idAtual = Cfg.entradaId
+                          cheio = 0
+                      }
                       var lidos = 0
                       while (lidos < HOP && rodando) {
                           val r = rec.read(hop, lidos, HOP - lidos)
@@ -546,6 +570,8 @@ jobs:
           import android.graphics.PixelFormat
           import android.graphics.PointF
           import android.graphics.drawable.GradientDrawable
+          import android.media.AudioDeviceInfo
+          import android.media.AudioManager
           import android.os.Handler
           import android.os.Looper
           import android.os.SystemClock
@@ -737,6 +763,34 @@ jobs:
                   main.post { ocultarHud(); mostrarHud() }
               }
 
+              private fun nomeEntrada(d: AudioDeviceInfo): String {
+                  val t = when (d.type) {
+                      AudioDeviceInfo.TYPE_BUILTIN_MIC -> "Microfone do celular"
+                      AudioDeviceInfo.TYPE_WIRED_HEADSET -> "Cabo/fone P2"
+                      AudioDeviceInfo.TYPE_LINE_ANALOG -> "Entrada de linha"
+                      AudioDeviceInfo.TYPE_USB_DEVICE -> "USB"
+                      AudioDeviceInfo.TYPE_USB_HEADSET -> "USB (fone)"
+                      AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "Bluetooth"
+                      else -> "Outro (tipo ${d.type})"
+                  }
+                  return "$t ${d.productName}"
+              }
+
+              private fun entradas(): List<AudioDeviceInfo> =
+                  getSystemService(AudioManager::class.java).getDevices(AudioManager.GET_DEVICES_INPUTS).toList()
+
+              private fun rotuloEntrada(): String {
+                  val atual = entradas().firstOrNull { it.id == Cfg.entradaId }
+                  return "Entrada de áudio: " + (if (Cfg.entradaId == 0 || atual == null) "automática" else nomeEntrada(atual)) +
+                      "\n(toque para trocar)"
+              }
+
+              private fun listaEntradas(): String {
+                  val l = entradas()
+                  return if (l.isEmpty()) "Entradas disponíveis: nenhuma"
+                  else "Entradas disponíveis:\n" + l.joinToString("\n") { "• " + nomeEntrada(it) }
+              }
+
               private fun slider(
                   pai: LinearLayout, titulo: String, vmin: Float, vmax: Float,
                   ler: () -> Float, gravar: (Float) -> Unit, fmt: (Float) -> String
@@ -803,6 +857,22 @@ jobs:
                   preset("Modo piano") { Cfg.modoPiano() }
                   preset("Modo ocarina") { Cfg.modoOcarina() }
                   col.addView(linhaPre)
+
+                  // Entrada de áudio (microfone, cabo P2, USB)
+                  val tvEnt = txt(listaEntradas(), 11f)
+                  val btnEntrada = Button(this)
+                  btnEntrada.textSize = 12f
+                  btnEntrada.text = rotuloEntrada()
+                  btnEntrada.setOnClickListener {
+                      val ids = listOf(0) + entradas().map { it.id }
+                      val i = ids.indexOf(Cfg.entradaId)
+                      Cfg.entradaId = ids[(i + 1) % ids.size]
+                      Cfg.salvar(this@TapService)
+                      btnEntrada.text = rotuloEntrada()
+                      tvEnt.text = listaEntradas()
+                  }
+                  col.addView(btnEntrada)
+                  col.addView(tvEnt)
 
                   // Deslocamento de oitava
                   val tvDesl = txt("", 12f)
