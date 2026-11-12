@@ -88,6 +88,66 @@ jobs:
               </application>
           </manifest>
           ARQUIVO_FIM
+          mkdir -p "$(dirname 'app/src/main/java/com/example/ocarina/Cfg.kt')"
+          cat > 'app/src/main/java/com/example/ocarina/Cfg.kt' << 'ARQUIVO_FIM'
+          package com.example.ocarina
+
+          import android.content.Context
+
+          // Configurações ajustáveis pelo HUD flutuante (salvas no aparelho)
+          object Cfg {
+              @Volatile var ativo = true
+              @Volatile var volumeMin = 0.01f
+              @Volatile var tonalidade = 6f
+              @Volatile var tolerancia = 50f
+              @Volatile var soltarMs = 250f
+              @Volatile var estabilidade = 2f
+              @Volatile var deslocar = 12
+              @Volatile var afinacao = 0f
+              @Volatile var retocar = true
+              @Volatile var stepMs = 120f
+              private var carregado = false
+
+              fun init(ctx: Context) {
+                  if (carregado) return
+                  carregado = true
+                  val sp = ctx.getSharedPreferences("cfg", Context.MODE_PRIVATE)
+                  volumeMin = sp.getFloat("volumeMin", volumeMin)
+                  tonalidade = sp.getFloat("tonalidade", tonalidade)
+                  tolerancia = sp.getFloat("tolerancia", tolerancia)
+                  soltarMs = sp.getFloat("soltarMs", soltarMs)
+                  estabilidade = sp.getFloat("estabilidade", estabilidade)
+                  deslocar = sp.getInt("deslocar", deslocar)
+                  afinacao = sp.getFloat("afinacao", afinacao)
+                  retocar = sp.getBoolean("retocar", retocar)
+                  stepMs = sp.getFloat("stepMs", stepMs)
+              }
+
+              fun salvar(ctx: Context) {
+                  ctx.getSharedPreferences("cfg", Context.MODE_PRIVATE).edit()
+                      .putFloat("volumeMin", volumeMin)
+                      .putFloat("tonalidade", tonalidade)
+                      .putFloat("tolerancia", tolerancia)
+                      .putFloat("soltarMs", soltarMs)
+                      .putFloat("estabilidade", estabilidade)
+                      .putInt("deslocar", deslocar)
+                      .putFloat("afinacao", afinacao)
+                      .putBoolean("retocar", retocar)
+                      .putFloat("stepMs", stepMs)
+                      .apply()
+              }
+
+              fun modoPiano() {
+                  volumeMin = 0.006f; tonalidade = 4f; tolerancia = 50f
+                  soltarMs = 400f; estabilidade = 3f; retocar = true; stepMs = 120f
+              }
+
+              fun modoOcarina() {
+                  volumeMin = 0.01f; tonalidade = 6f; tolerancia = 50f
+                  soltarMs = 250f; estabilidade = 2f; retocar = true; stepMs = 120f
+              }
+          }
+          ARQUIVO_FIM
           mkdir -p "$(dirname 'app/src/main/java/com/example/ocarina/MainActivity.kt')"
           cat > 'app/src/main/java/com/example/ocarina/MainActivity.kt' << 'ARQUIVO_FIM'
           package com.example.ocarina
@@ -120,6 +180,7 @@ jobs:
 
               override fun onCreate(b: Bundle?) {
                   super.onCreate(b)
+                  Cfg.init(this)
                   val ll = LinearLayout(this).apply {
                       orientation = LinearLayout.VERTICAL
                       setPadding(48, 48, 48, 48)
@@ -143,6 +204,12 @@ jobs:
                       }
                   }
                   botao("3. Iniciar ocarina") { iniciar() }
+                  botao("4. Mostrar/ocultar HUD flutuante") {
+                      val s = TapService.instance
+                      if (s == null) {
+                          Toast.makeText(this, "Ative o serviço de acessibilidade primeiro", Toast.LENGTH_LONG).show()
+                      } else s.alternarHud()
+                  }
                   botao("Parar") { stopService(Intent(this, OcarinaService::class.java)) }
                   ll.addView(status)
                   setContentView(ll)
@@ -182,6 +249,7 @@ jobs:
           import android.os.IBinder
           import kotlin.math.PI
           import kotlin.math.abs
+          import kotlin.math.ceil
           import kotlin.math.cos
           import kotlin.math.ln
           import kotlin.math.log2
@@ -198,10 +266,10 @@ jobs:
           class OcarinaService : Service() {
 
               companion object {
-                  // ===================== CONFIGURAÇÃO =====================
                   // Para ADICIONAR NOTAS: acrescente linhas aqui. Dois botões iguais usam a mesma posição.
                   // Cada botão novo será pedido na calibração.
                   // MIDI: Dó=60 Dó#=61 Ré=62 Ré#=63 Mi=64 Fá=65 Fá#=66 Sol=67 Sol#=68 Lá=69 Lá#=70 Si=71 Dó agudo=72
+                  // As demais configurações (oitava, sensibilidade etc.) ficam no HUD flutuante.
                   val NOTAS = listOf(
                       Nota("Ré", 62, "A"),
                       Nota("Fá", 65, "C-Baixo"),
@@ -213,27 +281,13 @@ jobs:
                       // Nota("Sol", 67, "Z"),
                   )
 
-                  // Semitons que sua ocarina soa ACIMA da notação acima.
-                  // Ocarina 12 furos Alto C = 12. Se a sua soar mais grave, use 0.
-                  // A tela do app mostra a nota real detectada para você conferir.
-                  const val DESLOCAR = 12
-
-                  // Se sua ocarina é afinada diferente de A=440 Hz, ajuste em cents (ex.: -30).
-                  const val AFINACAO = 0.0
-
-                  // Margem aceita de desafinação, em cents (100 cents = 1 semitom).
-                  const val TOLERANCIA = 50.0
-
-                  const val VOLUME_MIN = 0.01   // sobe se pegar ruído, desce se não detectar
-                  const val TONALIDADE = 6.0    // sobe se pegar ruído, desce se não detectar notas
-                  // ========================================================
-
                   val BOTOES: List<String> get() = NOTAS.map { it.botao }.distinct()
 
                   const val SR = 44100
                   const val HOP = 1024        // análise a cada ~23 ms
                   const val JANELA = 4096     // trecho analisado (~93 ms)
                   const val FFT_N = 16384
+                  const val HOP_MS = 1000.0 * HOP / SR
 
                   val NOMES_NOTAS = arrayOf("Dó", "Dó#", "Ré", "Ré#", "Mi", "Fá", "Fá#", "Sol", "Sol#", "Lá", "Lá#", "Si")
 
@@ -243,6 +297,7 @@ jobs:
 
               @Volatile private var rodando = false
               private var thread: Thread? = null
+              private var ultimoRms = 0.0
 
               private val re = DoubleArray(FFT_N)
               private val im = DoubleArray(FFT_N)
@@ -252,14 +307,13 @@ jobs:
               private val sinT = DoubleArray(FFT_N / 2) { sin(-2 * PI * it / FFT_N) }
               private val rev = IntArray(FFT_N) { Integer.reverse(it) ushr (32 - Integer.numberOfTrailingZeros(FFT_N)) }
               private val binHz = SR.toDouble() / FFT_N
-              private val iMin = (NOTAS.minOf { freqDe(it) } * 0.85 / binHz).toInt()
-              private val iMax = min((NOTAS.maxOf { freqDe(it) } * 1.15 / binHz).toInt(), FFT_N / 2 - 2)
 
-              private fun freqDe(n: Nota): Double = 440.0 * 2.0.pow((n.midi + DESLOCAR - 69) / 12.0)
+              private fun freqDe(n: Nota): Double = 440.0 * 2.0.pow((n.midi + Cfg.deslocar - 69) / 12.0)
 
               override fun onBind(i: Intent?): IBinder? = null
 
               override fun onStartCommand(i: Intent?, flags: Int, id: Int): Int {
+                  Cfg.init(this)
                   val nm = getSystemService(NotificationManager::class.java)
                   nm.createNotificationChannel(NotificationChannel("ocarina", "Ocarina", NotificationManager.IMPORTANCE_LOW))
                   val n = Notification.Builder(this, "ocarina")
@@ -293,8 +347,11 @@ jobs:
                   rec.startRecording()
                   val hop = ShortArray(HOP)
                   val ring = DoubleArray(JANELA)
+                  val hist = DoubleArray(4)
+                  var histI = 0
                   var cheio = 0
                   var cand = -1; var cont = 0; var silencio = 0; var atual = -1
+                  var ultimoPress = 0L
 
                   while (rodando) {
                       var lidos = 0
@@ -309,21 +366,53 @@ jobs:
                       for (i in 0 until HOP) ring[JANELA - HOP + i] = hop[i] / 32768.0
                       if (cheio < JANELA) { cheio += HOP; continue }
 
-                      val nota = analisar(ring)
+                      if (!Cfg.ativo) {
+                          if (atual != -1) { atual = -1; TapService.instance?.pressButton(null) }
+                          cand = -1; cont = 0; silencio = 0
+                          ultimaNota = "(pausado)"
+                          continue
+                      }
+
+                      val nota = analisar(ring, atual != -1)
+                      val rms = ultimoRms
+                      val rmsAnterior = (hist[0] + hist[1] + hist[2] + hist[3]) / 4
+                      hist[histI] = rms
+                      histI = (histI + 1) % 4
+
+                      val agora = System.currentTimeMillis()
+                      val estab = Cfg.estabilidade.roundToInt().coerceIn(1, 8)
+                      val maxSilencio = ceil(Cfg.soltarMs / HOP_MS).toInt().coerceAtLeast(1)
+
                       if (nota < 0) {
-                          silencio++; cand = -1; cont = 0
-                          if (silencio >= 3 && atual != -1) {
+                          // Falhas curtas não soltam o botão: só solta depois de "soltarMs" de silêncio
+                          cand = -1; cont = 0; silencio++
+                          if (atual != -1 && silencio >= maxSilencio) {
                               atual = -1; ultimaNota = "-"
                               TapService.instance?.pressButton(null)
                           }
-                          continue
-                      }
-                      silencio = 0
-                      if (nota == cand) cont++ else { cand = nota; cont = 1 }
-                      if (cont >= 2 && nota != atual) {
-                          atual = nota
-                          ultimaNota = NOTAS[nota].nome + " -> " + NOTAS[nota].botao
-                          TapService.instance?.pressButton(NOTAS[nota].botao)
+                      } else {
+                          silencio = 0
+                          if (nota == cand) cont++ else { cand = nota; cont = 1 }
+                          if (atual == -1) {
+                              if (cont >= estab) {
+                                  atual = nota
+                                  ultimaNota = NOTAS[nota].nome + " -> " + NOTAS[nota].botao
+                                  TapService.instance?.pressButton(NOTAS[nota].botao)
+                                  ultimoPress = agora
+                              }
+                          } else if (nota != atual) {
+                              // Trocar de nota exige mais confirmações do que começar uma
+                              if (cont >= estab + 1) {
+                                  atual = nota
+                                  ultimaNota = NOTAS[nota].nome + " -> " + NOTAS[nota].botao
+                                  TapService.instance?.pressButton(NOTAS[nota].botao)
+                                  ultimoPress = agora
+                              }
+                          } else if (Cfg.retocar && rms > 1.6 * rmsAnterior && rms > Cfg.volumeMin && agora - ultimoPress > 300) {
+                              // Mesma nota tocada de novo (volume subiu de repente): aperta outra vez
+                              TapService.instance?.repress(NOTAS[nota].botao)
+                              ultimoPress = agora
+                          }
                       }
                   }
                   rec.stop(); rec.release()
@@ -332,7 +421,7 @@ jobs:
               }
 
               // Devolve o índice da nota em NOTAS, ou -1 se não houver nota válida
-              private fun analisar(x: DoubleArray): Int {
+              private fun analisar(x: DoubleArray, sustentando: Boolean): Int {
                   var mean = 0.0
                   for (v in x) mean += v
                   mean /= JANELA
@@ -344,9 +433,22 @@ jobs:
                       im[i] = 0.0
                   }
                   val rms = sqrt(ss / JANELA)
-                  if (rms < VOLUME_MIN) { debug = "vol=%.3f (baixo demais)".format(rms); return -1 }
+                  ultimoRms = rms
+                  // Enquanto uma nota soa, aceita volume e "limpeza" menores (a nota vai morrendo)
+                  val volMin = Cfg.volumeMin * (if (sustentando) 0.4 else 1.0)
+                  if (rms < volMin) { debug = "vol=%.3f (baixo demais)".format(rms); return -1 }
                   for (i in JANELA until FFT_N) { re[i] = 0.0; im[i] = 0.0 }
                   fft()
+
+                  var fLo = Double.MAX_VALUE
+                  var fHi = 0.0
+                  for (n in NOTAS) {
+                      val f = freqDe(n)
+                      if (f < fLo) fLo = f
+                      if (f > fHi) fHi = f
+                  }
+                  val iMin = max(4, (fLo * 0.45 / binHz).toInt())
+                  val iMax = min((fHi * 1.15 / binHz).toInt(), FFT_N / 2 - 2)
 
                   var soma = 0.0
                   var p = iMin
@@ -357,7 +459,8 @@ jobs:
                       if (m > mag[p]) p = i
                   }
                   val media = soma / (iMax - iMin + 1)
-                  if (mag[p] < TONALIDADE * media) { debug = "vol=%.3f (nenhuma nota clara)".format(rms); return -1 }
+                  val ton = Cfg.tonalidade * (if (sustentando) 0.6 else 1.0)
+                  if (mag[p] < ton * media) { debug = "vol=%.3f (nenhuma nota clara)".format(rms); return -1 }
 
                   // Se o pico for um harmônico (2x), usa a fundamental
                   val h = p / 2
@@ -377,12 +480,12 @@ jobs:
                       if (den != 0.0) d = 0.5 * (a - c) / den
                   }
                   val f = (p + d) * binHz
-                  val midi = 69 + 12 * log2(f / 440.0) - AFINACAO / 100.0
+                  val midi = 69 + 12 * log2(f / 440.0) - Cfg.afinacao / 100.0
 
                   var melhor = -1
                   var melhorDif = 1e9
                   for (i in NOTAS.indices) {
-                      val dif = abs(midi - (NOTAS[i].midi + DESLOCAR)) * 100
+                      val dif = abs(midi - (NOTAS[i].midi + Cfg.deslocar)) * 100
                       if (dif < melhorDif) { melhorDif = dif; melhor = i }
                   }
 
@@ -391,7 +494,7 @@ jobs:
                   debug = "%.0f Hz = %s%d (%+.0f c)  vol=%.3f".format(
                       f, NOMES_NOTAS[((m0 % 12) + 12) % 12], m0 / 12 - 1, cents, rms
                   )
-                  return if (melhorDif <= TOLERANCIA) melhor else -1
+                  return if (melhorDif <= Cfg.tolerancia) melhor else -1
               }
 
               private fun fft() {
@@ -442,21 +545,32 @@ jobs:
           import android.graphics.Path
           import android.graphics.PixelFormat
           import android.graphics.PointF
+          import android.graphics.drawable.GradientDrawable
           import android.os.Handler
           import android.os.Looper
+          import android.os.SystemClock
           import android.view.Gravity
           import android.view.MotionEvent
+          import android.view.View
           import android.view.ViewGroup
           import android.view.WindowManager
           import android.view.accessibility.AccessibilityEvent
+          import android.widget.Button
+          import android.widget.CheckBox
           import android.widget.FrameLayout
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.SeekBar
           import android.widget.TextView
+          import kotlin.math.abs
+          import kotlin.math.min
 
           class TapService : AccessibilityService() {
 
               companion object {
                   @Volatile var instance: TapService? = null
-                  private const val STEP = 60L // duração de cada pedaço do "toque contínuo"
+                  @Volatile var nCancel = 0       // toques cancelados pelo sistema (diagnóstico)
+                  @Volatile var nComandos = 0     // apertos pedidos pelo detector (diagnóstico)
               }
 
               private val main = Handler(Looper.getMainLooper())
@@ -464,17 +578,46 @@ jobs:
               private var activePt: PointF? = null
               private var wanted: PointF? = null
               private var busy = false
+              private var forceEnd = false
+              private var noPressBefore = 0L
               private var camada: FrameLayout? = null
 
-              override fun onServiceConnected() { instance = this }
+              private var hud: LinearLayout? = null
+              private var cabTv: TextView? = null
+              private var stTv: TextView? = null
+              private var hudAberto = false
+              private var hudX = 40
+              private var hudY = 200
+
+              private val atualizarHud = object : Runnable {
+                  override fun run() {
+                      val n = OcarinaService.ultimaNota
+                      cabTv?.text = if (n != "-") "♪ $n" else "♪ Ocarina"
+                      if (hudAberto) {
+                          stTv?.text = "Nota: $n\n${OcarinaService.debug}\n" +
+                              "Apertos pedidos: $nComandos | Toques cancelados: $nCancel"
+                      }
+                      main.postDelayed(this, 200)
+                  }
+              }
+
+              override fun onServiceConnected() { instance = this; Cfg.init(this) }
               override fun onAccessibilityEvent(e: AccessibilityEvent?) {}
               override fun onInterrupt() {}
-              override fun onDestroy() { instance = null; super.onDestroy() }
+              override fun onDestroy() { ocultarHud(); instance = null; super.onDestroy() }
 
               // botao = nome do botão (ex.: "A", "C-Baixo") ou null para soltar
               fun pressButton(botao: String?) {
                   val p = if (botao == null) null else loadPoint(botao)
+                  if (p != null) nComandos++
                   main.post { wanted = p; pump() }
+              }
+
+              // Solta e aperta de novo o mesmo botão (nota repetida)
+              fun repress(botao: String) {
+                  val p = loadPoint(botao)
+                  if (p != null) nComandos++
+                  main.post { wanted = p; forceEnd = true; pump() }
               }
 
               private fun loadPoint(b: String): PointF? {
@@ -488,16 +631,20 @@ jobs:
               // Mantém um único dedo "virtual" apertado enquanto a nota estiver soando
               private fun pump() {
                   if (busy) return
+                  val passo = Cfg.stepMs.toLong()
                   val s = stroke
                   val a = activePt
                   val w = wanted
                   if (s != null && a != null) {
-                      val keep = w != null && w == a
-                      val next = s.continueStroke(pathAt(a), 0, STEP, keep)
+                      val keep = w != null && w == a && !forceEnd
+                      if (!keep && forceEnd) { forceEnd = false; noPressBefore = SystemClock.uptimeMillis() + 50 }
+                      val next = s.continueStroke(pathAt(a), 0, if (keep) passo else 1L, keep)
                       if (keep) stroke = next else { stroke = null; activePt = null }
                       send(next)
                   } else if (w != null) {
-                      val next = StrokeDescription(pathAt(w), 0, STEP, true)
+                      val espera = noPressBefore - SystemClock.uptimeMillis()
+                      if (espera > 0) { main.postDelayed({ pump() }, espera); return }
+                      val next = StrokeDescription(pathAt(w), 0, passo, true)
                       stroke = next; activePt = w
                       send(next)
                   }
@@ -510,17 +657,20 @@ jobs:
                       object : GestureResultCallback() {
                           override fun onCompleted(g: GestureDescription?) { busy = false; pump() }
                           override fun onCancelled(g: GestureDescription?) {
-                              busy = false; stroke = null; activePt = null; pump()
+                              nCancel++
+                              busy = false; stroke = null; activePt = null
+                              main.postDelayed({ pump() }, 80)
                           }
                       }, null
                   )
                   if (!ok) { busy = false; stroke = null; activePt = null }
               }
 
+              // ============ Calibração ============
               // Mostra uma camada transparente: você toca onde fica cada botão do emulador
               fun startCalibration(delayMs: Long) {
                   main.postDelayed({
-                      val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                      val wm = wmgr()
                       camada?.let { try { wm.removeView(it) } catch (e: Exception) {} }
                       val ed = getSharedPreferences("ocarina", MODE_PRIVATE).edit()
                       val nomes = OcarinaService.BOTOES
@@ -558,6 +708,195 @@ jobs:
                       wm.addView(root, lp)
                       camada = root
                   }, delayMs)
+              }
+
+              // ============ HUD flutuante ============
+              private fun wmgr() = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              private fun fundo(cor: Int) = GradientDrawable().apply {
+                  setColor(cor)
+                  cornerRadius = dp(12).toFloat()
+              }
+
+              private fun txt(t: String, tam: Float = 13f) = TextView(this).apply {
+                  text = t; textSize = tam; setTextColor(Color.WHITE)
+              }
+
+              fun alternarHud() {
+                  main.post { if (hud == null) mostrarHud() else ocultarHud() }
+              }
+
+              private fun ocultarHud() {
+                  main.removeCallbacks(atualizarHud)
+                  hud?.let { try { wmgr().removeView(it) } catch (e: Exception) {} }
+                  hud = null
+              }
+
+              private fun recarregarHud() {
+                  main.post { ocultarHud(); mostrarHud() }
+              }
+
+              private fun slider(
+                  pai: LinearLayout, titulo: String, vmin: Float, vmax: Float,
+                  ler: () -> Float, gravar: (Float) -> Unit, fmt: (Float) -> String
+              ) {
+                  val tv = txt("$titulo: ${fmt(ler())}", 12f)
+                  val sb = SeekBar(this)
+                  sb.max = 1000
+                  sb.progress = (((ler() - vmin) / (vmax - vmin)) * 1000).toInt().coerceIn(0, 1000)
+                  sb.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                      override fun onProgressChanged(s: SeekBar?, p: Int, u: Boolean) {
+                          val v = vmin + (vmax - vmin) * p / 1000f
+                          gravar(v)
+                          tv.text = "$titulo: ${fmt(v)}"
+                      }
+                      override fun onStartTrackingTouch(s: SeekBar?) {}
+                      override fun onStopTrackingTouch(s: SeekBar?) { Cfg.salvar(this@TapService) }
+                  })
+                  pai.addView(tv)
+                  pai.addView(sb)
+              }
+
+              private fun mostrarHud() {
+                  Cfg.init(this)
+                  val wm = wmgr()
+                  val raiz = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+
+                  val cabecalho = txt("♪ Ocarina", 14f).apply {
+                      setPadding(dp(12), dp(8), dp(12), dp(8))
+                      background = fundo(Color.argb(220, 27, 94, 32))
+                  }
+                  val col = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(12), dp(8), dp(12), dp(12))
+                  }
+                  val rolagem = ScrollView(this).apply {
+                      background = fundo(Color.argb(235, 24, 24, 24))
+                      addView(col)
+                      visibility = if (hudAberto) View.VISIBLE else View.GONE
+                  }
+                  val larg = min(dp(300), (resources.displayMetrics.widthPixels * 0.9).toInt())
+                  val alt = (resources.displayMetrics.heightPixels * 0.55).toInt()
+                  raiz.addView(cabecalho)
+                  raiz.addView(rolagem, LinearLayout.LayoutParams(larg, alt))
+
+                  // Estado ao vivo
+                  val st = txt("...", 12f)
+                  col.addView(st)
+
+                  col.addView(CheckBox(this).apply {
+                      text = "Escuta ativa"
+                      setTextColor(Color.WHITE)
+                      isChecked = Cfg.ativo
+                      setOnCheckedChangeListener { _, v -> Cfg.ativo = v }
+                  })
+
+                  // Modos prontos
+                  val linhaPre = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  fun preset(nome: String, f: () -> Unit) {
+                      linhaPre.addView(Button(this).apply {
+                          text = nome; textSize = 12f
+                          setOnClickListener { f(); Cfg.salvar(this@TapService); recarregarHud() }
+                      }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                  }
+                  preset("Modo piano") { Cfg.modoPiano() }
+                  preset("Modo ocarina") { Cfg.modoOcarina() }
+                  col.addView(linhaPre)
+
+                  // Deslocamento de oitava
+                  val tvDesl = txt("", 12f)
+                  fun atualizarDesl() { tvDesl.text = "Deslocar notas: ${Cfg.deslocar} semitons (12 = uma oitava acima)" }
+                  atualizarDesl()
+                  col.addView(tvDesl)
+                  val linhaD = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  for (d in intArrayOf(-12, -1, 1, 12)) {
+                      linhaD.addView(Button(this).apply {
+                          text = if (d > 0) "+$d" else "$d"
+                          textSize = 12f
+                          setOnClickListener { Cfg.deslocar += d; atualizarDesl(); Cfg.salvar(this@TapService) }
+                      }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                  }
+                  col.addView(linhaD)
+
+                  slider(col, "Volume mínimo (menor = mais sensível)", 0.002f, 0.05f,
+                      { Cfg.volumeMin }, { Cfg.volumeMin = it }, { "%.3f".format(it) })
+                  slider(col, "Exigência de nota clara (menor = aceita mais)", 2f, 15f,
+                      { Cfg.tonalidade }, { Cfg.tonalidade = it }, { "%.1f".format(it) })
+                  slider(col, "Tolerância de afinação (cents)", 10f, 100f,
+                      { Cfg.tolerancia }, { Cfg.tolerancia = it }, { "%.0f".format(it) })
+                  slider(col, "Tempo para soltar (ms)", 50f, 800f,
+                      { Cfg.soltarMs }, { Cfg.soltarMs = it }, { "%.0f".format(it) })
+                  slider(col, "Estabilidade (confirmações antes de apertar)", 1f, 6f,
+                      { Cfg.estabilidade }, { Cfg.estabilidade = it }, { "%.0f".format(it) })
+                  slider(col, "Afinação (cents)", -100f, 100f,
+                      { Cfg.afinacao }, { Cfg.afinacao = it }, { "%+.0f".format(it) })
+                  slider(col, "Duração de cada bloco do toque (ms)", 40f, 400f,
+                      { Cfg.stepMs }, { Cfg.stepMs = it }, { "%.0f".format(it) })
+
+                  col.addView(CheckBox(this).apply {
+                      text = "Apertar de novo ao repetir a mesma nota"
+                      setTextColor(Color.WHITE)
+                      isChecked = Cfg.retocar
+                      setOnCheckedChangeListener { _, v -> Cfg.retocar = v; Cfg.salvar(this@TapService) }
+                  })
+
+                  col.addView(Button(this).apply {
+                      text = "Calibrar botões (começa em 5 s)"
+                      setOnClickListener {
+                          hudAberto = false
+                          rolagem.visibility = View.GONE
+                          startCalibration(5000)
+                      }
+                  })
+                  col.addView(Button(this).apply {
+                      text = "Fechar HUD"
+                      setOnClickListener { ocultarHud() }
+                  })
+
+                  val lp = WindowManager.LayoutParams(
+                      ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                      PixelFormat.TRANSLUCENT
+                  ).apply {
+                      gravity = Gravity.TOP or Gravity.START
+                      x = hudX
+                      y = hudY
+                  }
+
+                  // Arrastar pelo cabeçalho; toque simples abre/fecha o painel
+                  var iniX = 0; var iniY = 0; var toqueX = 0f; var toqueY = 0f; var moveu = false
+                  cabecalho.setOnTouchListener { _, ev ->
+                      when (ev.action) {
+                          MotionEvent.ACTION_DOWN -> {
+                              iniX = lp.x; iniY = lp.y; toqueX = ev.rawX; toqueY = ev.rawY; moveu = false
+                          }
+                          MotionEvent.ACTION_MOVE -> {
+                              val dx = ev.rawX - toqueX
+                              val dy = ev.rawY - toqueY
+                              if (abs(dx) > 12 || abs(dy) > 12) moveu = true
+                              if (moveu) {
+                                  lp.x = iniX + dx.toInt(); lp.y = iniY + dy.toInt()
+                                  hudX = lp.x; hudY = lp.y
+                                  wm.updateViewLayout(raiz, lp)
+                              }
+                          }
+                          MotionEvent.ACTION_UP -> {
+                              if (!moveu) {
+                                  hudAberto = !hudAberto
+                                  rolagem.visibility = if (hudAberto) View.VISIBLE else View.GONE
+                              }
+                          }
+                      }
+                      true
+                  }
+
+                  wm.addView(raiz, lp)
+                  hud = raiz
+                  cabTv = cabecalho
+                  stTv = st
+                  main.post(atualizarHud)
               }
           }
           ARQUIVO_FIM
